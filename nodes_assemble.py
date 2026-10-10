@@ -912,8 +912,12 @@ class H3Timeline:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "emit"
-    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN")
-    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling")
+    # images/audio/fps APPENDED: output links are positional, so new
+    # outputs may only go on the end or every saved Timeline rewires.
+    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN",
+                    "IMAGE", "AUDIO", "FLOAT")
+    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling",
+                    "images", "audio", "fps")
     OUTPUT_TOOLTIPS = (
         "Pin spec for the clip pinned in the timeline widget (extend/"
         "prepend); empty when nothing is pinned. Wire to H3MCtxApplyPins "
@@ -933,6 +937,17 @@ class H3Timeline:
         "(the generation branch muted when this is true, the refine "
         "branch when it is false, through a Not node) so one switch "
         "decides and the branches cannot disagree.",
+        "The finished cut as frames -- the same picture the full preview "
+        "and export show (crossfades and level lock applied). Built only "
+        "while the upscale toggle is ON; off, it is a single black "
+        "placeholder frame so generation runs pay nothing. Wire to a "
+        "pixel upscaler (e.g. SeedVR2) instead of the latent refine "
+        "branch.",
+        "The finished cut's audio track (None when the cut is silent or "
+        "the upscale toggle is off). Wire to the video combine/save node "
+        "after the upscaler.",
+        "Frame rate of the images output, for the video combine/save "
+        "node.",
     )
     DESCRIPTION = (
         "Timeline editor for composed clips: seam-aware blocks, "
@@ -1164,14 +1179,34 @@ class H3Timeline:
             },
         }
 
+    # The seam-repair widgets, forwarded verbatim to build_preview so the
+    # images output is the cut the widget previews and exports.
+    _FIX_KEYS = ("level_lock", "level_lock_frames", "level_lock_flicker",
+                 "level_lock_local", "crossfade", "crossfade_frames",
+                 "audio_declick")
+
     @classmethod
-    def IS_CHANGED(cls, pin_state="", **_):
+    def IS_CHANGED(cls, pin_state="", upscaling=False, sequence="", **kw):
         # Re-run when the pin selection OR the pinned file(s) change
         # (same clip name, new content after a re-save).
+        sig = ""
+        if upscaling is True or (isinstance(upscaling, str) and
+                                 upscaling.strip().lower() in
+                                 ("upscale", "true", "1")):
+            # the images output depends on every clip and every repair
+            # option; a stale cache would feed the upscaler an old cut
+            try:
+                sig = "frames:%s|%s|%s|" % (
+                    H3Assemble.IS_CHANGED(sequence),
+                    json.dumps({k: kw.get(k) for k in cls._FIX_KEYS
+                                + ("crf",)}, sort_keys=True),
+                    sequence)
+            except Exception:
+                return float("nan")
         state = cls._parse_pin_state(pin_state)
         if state is None:
-            return ""
-        sig = pin_state
+            return sig
+        sig += pin_state
         for key in ("source", "source2"):
             if not state.get(key):
                 continue
@@ -1356,8 +1391,40 @@ class H3Timeline:
                       "shared AV grid, audio-exact" if masks
                       else "17k+5 ladder"))
 
+    def _render_frames(self, sequence, crf=19, base_folder="",
+                       preview_filename=None, **kw):
+        """(images, audio) of the finished cut, via the preview build.
+
+        Goes through build_preview rather than re-implementing the cut,
+        so crossfades, level lock and declick are exactly the widget's,
+        and a cut already previewed is served from its cached file.
+        """
+        from . import preview_route as pr
+        fixes = {k: kw[k] for k in self._FIX_KEYS if k in kw}
+        name, sub, _, _, _, _ = pr.build_preview(
+            sequence, int(crf), probe=False, base_folder=base_folder,
+            preview_filename=preview_filename, **fixes)
+        path = os.path.join(folder_paths.get_output_directory(), sub, name)
+        images = pr._decode_images(path)
+        audio = pr._decode_audio(path)
+        _LOG.info("obvpm.h3: timeline frames out: %d frames %dx%d%s",
+                  int(images.shape[0]), int(images.shape[2]),
+                  int(images.shape[1]),
+                  ", audio" if audio is not None else ", silent")
+        return images, audio
+
     def emit(self, sequence="", pin_state="", duration_seconds=8.0,
-             upscaling=False, **_):
+             upscaling=False, **kw):
+        out = self._emit(sequence, pin_state, duration_seconds, upscaling)
+        if out[3]:
+            images, audio = self._render_frames(sequence, **kw)
+        else:
+            import torch
+            images, audio = torch.zeros(1, 64, 64, 3), None
+        return out + (images, audio, float(fr.FPS))
+
+    def _emit(self, sequence="", pin_state="", duration_seconds=8.0,
+              upscaling=False):
         # First, before anything is read: the floor this pack itself
         # needs (compat.py). A workflow's own Compatibility Check node
         # carries the full list; this speaks only when that node could
