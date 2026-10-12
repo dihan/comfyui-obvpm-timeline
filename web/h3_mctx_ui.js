@@ -9129,9 +9129,33 @@ function buildResultPreview(node) {
     });
     btnRow.append(addTlBtn, delBtn, dismissBtn);
 
+    // ---- take picker: any take under this preview's save prefix ----
+    // The run's own take is shown automatically; this row lets an
+    // earlier one be brought back -- comparing seeds, or adding a take
+    // that was passed over at the time. Listed from the folder rather
+    // than from what this browser happened to see, so takes from
+    // earlier sessions are there too.
+    const pickRow = document.createElement("div");
+    Object.assign(pickRow.style,
+        { display: "none", gap: "4px", alignItems: "center" });
+    const pickPrev = rpBtn("◀", "Newer take");
+    const pickNext = rpBtn("▶", "Older take");
+    const pickSel = document.createElement("select");
+    pickSel.title = "Pick any take saved under this preview's save "
+        + "prefix, newest first";
+    Object.assign(pickSel.style, {
+        flex: "1", minWidth: "0", background: PAL.rest, color: PAL.text,
+        border: "1px solid " + PAL.edge, borderRadius: "4px",
+        font: "11px sans-serif", padding: "1px 4px",
+    });
+    const pickCount = document.createElement("span");
+    Object.assign(pickCount.style,
+        { font: "10px sans-serif", color: PAL.sub, whiteSpace: "nowrap" });
+    pickRow.append(pickPrev, pickSel, pickNext, pickCount);
+
     const rpProgress = tlProgressBar();
     const dropRpProgress = tlOnProgress(() => RP_PREVIEW_NAME, rpProgress);
-    container.append(liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
+    container.append(pickRow, liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
     const widget = node.addDOMWidget("mctx_result", "div", container,
                                      { hideOnZoom: false });
     widget.serialize = false;
@@ -9588,6 +9612,12 @@ function buildResultPreview(node) {
         dismissBtn.style.borderColor = PAL.edge;
         dismissBtn.style.color = PAL.text;
         status.style.color = PAL.sub;
+        for (const el of [pickPrev, pickNext, pickSel]) {
+            el.style.background = PAL.rest;
+            el.style.borderColor = PAL.edge;
+            el.style.color = PAL.text;
+        }
+        pickCount.style.color = PAL.sub;
     }
     // live theme following, same pattern as the Timeline: debounced
     // whole-palette compare (the var() strings alone never change)
@@ -9850,6 +9880,12 @@ function buildResultPreview(node) {
             });
             if (!resp.ok) throw new Error(await resp.text());
             const gone = current.clip;
+            // after rejecting a seed, the next one along is the natural
+            // thing to look at
+            const at = takes.indexOf(gone);
+            const nextTake = at >= 0
+                ? (takes[at + 1] ?? takes[at - 1] ?? null) : null;
+            rpPayloads.delete(gone);
             // module caches would otherwise serve a ghost if the save
             // counter reuses the name
             tlMetaCache.delete(gone);
@@ -9866,6 +9902,12 @@ function buildResultPreview(node) {
             btnRow.style.display = "none";
             status.style.color = PAL.sub;
             status.textContent = "deleted " + gone;
+            await refreshTakes();
+            if (nextTake && takes.includes(nextTake)) {
+                await pickTake(nextTake);
+                status.textContent = "deleted " + gone.split("/").pop()
+                    + " — showing " + nextTake.split("/").pop();
+            }
         } catch (err) {
             status.style.color = "#de5b5b";
             status.textContent = "delete failed: " +
@@ -9888,8 +9930,119 @@ function buildResultPreview(node) {
         lastShownAt = now;
         node.properties = node.properties || {};
         node.properties.h3_result = d;
+        rpPayloads.set(d.clip, d);
         void render(d);
+        void refreshTakes();
     };
+
+    // ---- take picker logic -------------------------------------------
+    let takes = [];                 // output-relative clips, newest first
+    const rpPayloads = new Map();   // clip -> payload seen this session
+    let takesSeq = 0;
+    // What to list: the save prefix this preview watches, else the
+    // folder of the take on screen. Nothing known -> no picker.
+    function takesPrefix() {
+        const scope = rpScopeFolder(node);
+        if (scope) return scope;
+        return current ? rpFolderOf(current.clip) + "/" : null;
+    }
+    function takeLabel(t, i) {
+        const name = t.clip.split("/").pop().replace(/\.mp4$/i, "");
+        const when = new Date(t.mtime * 1000);
+        const stamp = when.toLocaleDateString(undefined,
+                { month: "short", day: "numeric" }) + " "
+            + when.toLocaleTimeString(undefined,
+                { hour: "2-digit", minute: "2-digit" });
+        return `${name}  ·  ${stamp}${i === 0 ? "  (latest)" : ""}`;
+    }
+    function syncPicker() {
+        const i = current ? takes.indexOf(current.clip) : -1;
+        if (i >= 0) pickSel.value = current.clip;
+        else pickSel.selectedIndex = -1;
+        pickPrev.disabled = i <= 0;
+        pickNext.disabled = i < 0 || i >= takes.length - 1;
+        pickPrev.style.opacity = pickPrev.disabled ? "0.4" : "1";
+        pickNext.style.opacity = pickNext.disabled ? "0.4" : "1";
+        pickCount.textContent = takes.length
+            ? `${i >= 0 ? i + 1 : "–"} / ${takes.length}` : "";
+        pickRow.style.display = takes.length ? "flex" : "none";
+    }
+    async function refreshTakes() {
+        const prefix = takesPrefix();
+        const seq = ++takesSeq;
+        if (prefix == null) {
+            takes = [];
+            syncPicker();
+            return;
+        }
+        let list = [];
+        try {
+            const resp = await api.fetchApi("/obvpm/h3/list_takes", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prefix }),
+            });
+            if (resp.ok) list = (await resp.json()).takes ?? [];
+        } catch (err) {
+            list = [];
+        }
+        if (seq !== takesSeq) return;
+        takes = list.map((t) => t.clip);
+        pickSel.replaceChildren(...list.map((t, i) => {
+            const o = document.createElement("option");
+            o.value = t.clip;
+            o.textContent = takeLabel(t, i);
+            o.title = t.clip;
+            return o;
+        }));
+        syncPicker();
+        node.graph?.setDirtyCanvas(true);
+    }
+    // Lineage and the seam verdict are worked out server-side by the
+    // same show() a run uses, so a picked take reads exactly as it did
+    // when it was generated.
+    async function pickTake(clip) {
+        if (!clip || clip === current?.clip) return;
+        let d = rpPayloads.get(clip);
+        if (!d) {
+            status.style.color = PAL.sub;
+            status.textContent = "loading " + clip.split("/").pop() + "…";
+            try {
+                const resp = await api.fetchApi("/obvpm/h3/result_for", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ path: clip }),
+                });
+                const body = await resp.json();
+                if (!resp.ok || body.error) {
+                    throw new Error(body.error ?? resp.statusText);
+                }
+                d = body;
+            } catch (err) {
+                status.style.color = "#de5b5b";
+                status.textContent = "could not load take: " +
+                    String(err?.message ?? err).slice(0, 120);
+                syncPicker();
+                return;
+            }
+        }
+        void restoreResult(d);
+    }
+    pickSel.addEventListener("change", () => void pickTake(pickSel.value));
+    pickPrev.addEventListener("click", () => {
+        const i = takes.indexOf(current?.clip);
+        if (i > 0) void pickTake(takes[i - 1]);
+    });
+    pickNext.addEventListener("click", () => {
+        const i = takes.indexOf(current?.clip);
+        if (i >= 0 && i < takes.length - 1) void pickTake(takes[i + 1]);
+    });
+    // the list goes stale as other runs save; re-read it when opened
+    pickSel.addEventListener("mousedown", () => void refreshTakes());
+    // canvas wheel/drag must not steal the dropdown's own events
+    for (const el of [pickSel, pickPrev, pickNext]) {
+        el.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+    }
 
     // Pick up a run that finished while this workflow was in the
     // background: its `executed` event never reached this node (the node
@@ -9987,6 +10140,10 @@ function buildResultPreview(node) {
                 void restoreResult(saved);
             }
             adoptCachedResult();
+            for (const d of RP_RESULTS) {
+                if (rpAccepts(this, d)) rpPayloads.set(d.clip, d);
+            }
+            void refreshTakes();
             // Joining a run that is already in flight: the start event
             // fired before this node existed, so ask the queue instead.
             void rpQueueOwns(rpScopeFolder(this), null).then((owns) => {

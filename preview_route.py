@@ -1261,6 +1261,54 @@ def delete_take(path):
     return removed
 
 
+def list_takes(prefix, limit=200):
+    """Takes saved under one save prefix, newest first.
+
+    For the Result Preview's take picker: `prefix` is the joined save
+    prefix it watches ("project_3/clip"), and a take is what the save
+    nodes write under it -- "<prefix>_NNNNN.mp4". A prefix with no name
+    part ("project_3/") lists every take (MP4 with a sidecar) in that
+    folder instead.
+    Returns [{"clip", "mtime"}], output-relative.
+    """
+    import re
+    root = os.path.abspath(folder_paths.get_output_directory())
+    p = str(prefix or "").strip().replace("\\", "/").lstrip("/")
+    folder, _, name = p.rpartition("/")
+    d = os.path.abspath(os.path.join(root, folder))
+    if os.path.commonpath([root, d]) != root:
+        raise ValueError("list_takes: %r escapes the output folder" % prefix)
+    if not os.path.isdir(d):
+        return []
+    shape = (re.compile(re.escape(name) + r"_\d+\.mp4$", re.I) if name
+             else re.compile(r".*\.mp4$", re.I))
+    out = []
+    for f in os.listdir(d):
+        if not shape.match(f):
+            continue
+        ap = os.path.join(d, f)
+        # folder-wide, only real takes: previews and exports share the
+        # folder but carry no sidecar
+        if not name and not os.path.isfile(mctx.sidecar_path(ap)):
+            continue
+        try:
+            mt = os.stat(ap).st_mtime
+        except OSError:
+            continue
+        out.append({"clip": os.path.relpath(ap, root).replace(os.sep, "/"),
+                    "mtime": mt})
+    out.sort(key=lambda t: t["mtime"], reverse=True)
+    return out[:max(1, int(limit))]
+
+
+def result_for(path):
+    """The Result Preview payload for any saved take, not just the
+    run's: the same show() a run calls, so lineage and the measured
+    seam verdict come out identical."""
+    from .nodes_result import H3ResultPreview
+    return H3ResultPreview().show(path)["ui"]["h3_result"][0]
+
+
 def _fix_opts(data):
     """The seam-repair options as build_preview keywords.
 
@@ -1416,7 +1464,33 @@ def register():
                            type(exc).__name__, exc)
             return web.json_response({"error": str(exc)}, status=400)
 
+    @PromptServer.instance.routes.post("/obvpm/h3/list_takes")
+    async def _list_takes(request):
+        import asyncio
+        try:
+            data = await request.json()
+            found = await asyncio.to_thread(
+                list_takes, str(data.get("prefix", "")),
+                int(data.get("limit", 200) or 200))
+            return web.json_response({"takes": found})
+        except Exception as exc:
+            _LOG.info("obvpm.h3: list_takes failed: %s", exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/obvpm/h3/result_for")
+    async def _result_for(request):
+        import asyncio
+        try:
+            data = await request.json()
+            found = await asyncio.to_thread(
+                result_for, str(data.get("path", "")))
+            return web.json_response(found)
+        except Exception as exc:
+            _LOG.info("obvpm.h3: result_for failed: %s", exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
     _LOG.info("obvpm.h3: preview/export/delete/workflow routes registered "
               "(/obvpm/h3/preview_cut, /obvpm/h3/export, "
               "/obvpm/h3/delete_take, /obvpm/h3/video_workflow, "
-              "/obvpm/h3/seam_levels, /obvpm/h3/clip_meta)")
+              "/obvpm/h3/seam_levels, /obvpm/h3/clip_meta, "
+              "/obvpm/h3/list_takes, /obvpm/h3/result_for)")
