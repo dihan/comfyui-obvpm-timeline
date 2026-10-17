@@ -1258,6 +1258,15 @@ class H3Timeline:
                                "the strip's upscale toggle; comes out on "
                                "the upscaling output for the Mute If gates.",
                 }),
+                # Declared LAST (see the note above): widgets_values is
+                # positional, so new widgets may only be appended.
+                "upscale_skip": ("STRING", {
+                    "default": "",
+                    "tooltip": "The clips an upscale Run leaves out, set "
+                               "from the upscale pill on each clip. A "
+                               "JSON list of part ids or clip paths; "
+                               "empty upscales the whole timeline.",
+                }),
             },
         }
 
@@ -1278,11 +1287,11 @@ class H3Timeline:
             # the images output depends on every clip and every repair
             # option; a stale cache would feed the upscaler an old cut
             try:
-                sig = "frames:%s|%s|%s|" % (
+                sig = "frames:%s|%s|%s|%s|" % (
                     H3Assemble.IS_CHANGED(sequence),
                     json.dumps({k: kw.get(k) for k in cls._FIX_KEYS
                                 + ("crf",)}, sort_keys=True),
-                    sequence)
+                    sequence, kw.get("upscale_skip", ""))
             except Exception:
                 return float("nan")
         state = cls._parse_pin_state(pin_state)
@@ -1547,10 +1556,31 @@ class H3Timeline:
                   ", audio" if audio is not None else ", silent")
         return images, audio
 
+    @staticmethod
+    def _skip_keys(upscale_skip):
+        """The upscale_skip widget as a set of part ids / clip paths."""
+        try:
+            data = json.loads(upscale_skip) if upscale_skip else []
+        except (TypeError, ValueError):
+            _LOG.warning("obvpm.h3: ignoring unreadable upscale_skip %r",
+                         upscale_skip)
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(k) for k in data if isinstance(k, str) and k}
+
     def emit(self, sequence="", pin_state="", duration_seconds=8.0,
-             upscaling=False, **kw):
+             upscaling=False, upscale_skip="", **kw):
         out = self._emit(sequence, pin_state, duration_seconds, upscaling)
         if out[3]:
+            # Only the clips left on for the upscale go down the refine
+            # branch (and into the images output); generation still
+            # sees the whole timeline.
+            from . import nodes_joint as nj
+            skip = self._skip_keys(upscale_skip)
+            if skip:
+                sequence = nj.upscale_subset(sequence, skip)
+                out = (out[0], out[1], sequence, out[3])
             images, audio = self._render_frames(sequence, **kw)
         else:
             import torch
